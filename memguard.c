@@ -49,7 +49,9 @@
 #if LINUX_VERSION_CODE > KERNEL_VERSION(3, 8, 0)
 #  include <linux/sched/rt.h>
 #endif
+#include <uapi/linux/sched/types.h>
 #include <linux/sched.h>
+#include <linux/list.h>
 
 /**************************************************************************
  * Public Definitions
@@ -115,6 +117,19 @@ struct core_info {
 	long period_cnt;         /* active periods count */
 };
 
+// fch add
+// the global structure for Monitor the task
+struct memguard_task_monitor_info
+{
+	pid_t taskPid;	 // the pid of the pid to monitor
+	struct perf_event* cacheMissCounter;
+	
+	int cpuMask;
+	int budget;
+
+	struct list_head node;	// list ptr
+};
+
 /* global info */
 struct memguard_info {
 	int master;
@@ -129,6 +144,7 @@ struct memguard_info {
 	int bwlocked_cores;
 #endif
 	struct hrtimer hr_timer;
+	struct list_head taskMonitor;
 };
 
 
@@ -823,6 +839,70 @@ static void start_counters(void)
  * Local Functions
  **************************************************************************/
 
+static int memguard_init_task_monitor(struct memguard_task_monitor_info* monitor, char buf[], int* use_mb)
+{
+	char* p = buf;
+	char tmp_str[10] = "";
+	int tmp_num = 0;
+
+	sscanf(p, "%s", tmp_str);
+	tmp_num = simple_strtol(tmp_str, NULL, 10);
+	if (tmp_num <= 0) goto _zero;
+	monitor->taskPid = (pid_t) tmp_num;
+	p += strlen(tmp_str);
+	while ((*p) != 10 && (*p) != '\0' && (*p) == ' ') p++;
+	if ((*p) == 10 || (*p) == '\0') goto _uncompleted;
+
+	sscanf(p, "%s", tmp_str);
+	if (strcmp(tmp_str, "mb") == 0)
+	{
+		*use_mb = 1;
+		p += strlen("mb");
+		while ((*p) != 10 && (*p) != '\0' && (*p) == ' ') p++;
+	}
+	if ((*p) == 10 || (*p) == '\0') goto _uncompleted;
+
+	sscanf(p, "%s", tmp_str);
+	monitor->budget = simple_strtol(buf, NULL, 10);
+	if (monitor->budget <= 0) goto _zero;
+	p += strlen(tmp_str);
+	while ((*p) != 10 && (*p) != '\0' && (*p) == ' ') p++;
+	if ((*p) == 10 || (*p) == '\0') goto _uncompleted;
+
+	sscanf(p, "%s", tmp_str);
+	monitor->cpuMask = simple_strtol(tmp_str, NULL, 2);
+	if (monitor->cpuMask <= 0) goto _zero;
+
+	printk("[Memguard] : task monitor new config --- pid: %d budget: %d cpumask: %d use_num: %d\n", monitor->taskPid,
+																		monitor->budget,																monitor->cpuMask,
+																		*use_mb);
+	return 0;
+
+_uncompleted:
+	printk("[memguard] : The parameters of taskLimit is not enough");
+	return -1;
+_zero:
+	printk("[memguard] : The parameters PID budget and cpumask of taskLimit shouldn't be zero");
+	return -1;
+
+}
+
+static void memguard_clear_task_monitor(void)
+{
+	struct memguard_info* global = &memguard_info;
+
+	struct memguard_task_monitor_info *task_monitor = NULL, *tmp = NULL;
+
+    list_for_each_entry_safe(task_monitor, tmp, &(global->taskMonitor), node)
+	{
+		list_del(&task_monitor->node);
+
+		perf_event_disable(task_monitor->cacheMissCounter);
+		perf_event_release_kernel(task_monitor->cacheMissCounter);
+		kfree(task_monitor);
+	}
+}
+
 static ssize_t memguard_control_write(struct file *filp,
 				    const char __user *ubuf,
 				    size_t cnt, loff_t *ppos)
@@ -1014,6 +1094,57 @@ static const struct file_operations memguard_usage_fops = {
 	.release	= single_release,
 };
 
+static ssize_t memguard_task_monitor_write(struct file *filp,
+				    const char __user *ubuf,
+				    size_t cnt, loff_t *ppos)
+{
+	char buf[BUF_SIZE];
+	int use_mb = 0;
+
+	struct memguard_task_monitor_info* tmp_monitor \
+									= kmalloc(sizeof(struct memguard_task_monitor_info), GFP_KERNEL);
+	if (tmp_monitor == NULL)
+	{
+		printk("[Memguard} :Error to create memguard_task_monitor_info\n");
+		return cnt;
+	}
+	memset(tmp_monitor, 0, sizeof(struct memguard_task_monitor_info));
+
+	if (copy_from_user(&buf, ubuf, (cnt > BUF_SIZE) ? BUF_SIZE: cnt) != 0) 
+		return 0;
+
+	if (memguard_init_task_monitor(tmp_monitor, buf, &use_mb) == -1)
+	{
+		return cnt;
+	}
+
+	// ===== create kernel counter
+	// TODO:
+
+	return cnt;
+}
+
+static int memguard_task_limit_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "hello\n");
+
+	return 0;
+}
+
+static int memguard_task_limit_fops(struct inode *inode, struct file *filp)
+{
+	return single_open(filp, memguard_task_limit_show, NULL);
+}
+
+static const struct file_operations memgaurd_task_limit_fops = {
+	.open       = memguard_task_limit_fops,
+	.write      = memguard_task_monitor_write,
+	//.unlocked_ioctl = #TODO,
+	.read       = seq_read,
+	.llseek     = seq_lseek,
+	.release    = single_release,
+};
+
 static int memguard_init_debugfs(void)
 {
 
@@ -1027,6 +1158,10 @@ static int memguard_init_debugfs(void)
 
 	debugfs_create_file("usage", 0666, memguard_dir, NULL,
 			    &memguard_usage_fops);
+
+	// fch add
+	debugfs_create_file("taskLimit", 0444, memguard_dir, NULL,
+				&memgaurd_task_limit_fops);
 	return 0;
 }
 
