@@ -838,6 +838,52 @@ static void start_counters(void)
 /**************************************************************************
  * Local Functions
  **************************************************************************/
+static void event_overflow_callback_tmp(struct perf_event *event,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
+				    int nmi,
+#endif
+				    struct perf_sample_data *data,
+				    struct pt_regs *regs)
+{
+	printk("overflow, pid:%d\n", current->pid);
+}
+
+static int memguard_init_counter_for_task(struct memguard_task_monitor_info* monitor)
+{
+	// attributes
+	struct perf_event_attr sched_perf_hw_attr = 
+	{
+		// use generalized hardware abstraction 
+		.type           = PERF_TYPE_HARDWARE,
+		.config         = PERF_COUNT_HW_CACHE_MISSES,
+		.size		= sizeof(struct perf_event_attr),
+		.pinned		= 1,
+		.disabled	= 1,
+		.exclude_kernel = 1,   // TODO: 1 mean, no kernel mode counting 
+		.inherit = 1,	// to count child task threads
+		.sample_period = monitor->budget,
+	};
+	
+	struct task_struct *tmp_task = NULL;
+	tmp_task = pid_task(find_vpid(monitor->taskPid), PIDTYPE_PID);
+	if (!tmp_task)
+	{
+		printk("[Memguard] :The pid of the task is illegal, task monitor failed the creation\n");
+		return -1;
+	}
+
+	monitor->cacheMissCounter = perf_event_create_kernel_counter(&sched_perf_hw_attr,
+							-1, tmp_task,
+							event_overflow_callback_tmp, NULL);
+	if (monitor->cacheMissCounter == NULL)
+	{
+		printk("[Memguard] :faile to create task monitor\n");
+		return -1;
+	}
+
+	perf_event_enable(monitor->cacheMissCounter);
+	return 0;
+}
 
 static int memguard_init_task_monitor(struct memguard_task_monitor_info* monitor, char buf[], int* use_mb)
 {
@@ -863,7 +909,7 @@ static int memguard_init_task_monitor(struct memguard_task_monitor_info* monitor
 	if ((*p) == 10 || (*p) == '\0') goto _uncompleted;
 
 	sscanf(p, "%s", tmp_str);
-	monitor->budget = simple_strtol(buf, NULL, 10);
+	monitor->budget = simple_strtol(tmp_str, NULL, 10);
 	if (monitor->budget <= 0) goto _zero;
 	p += strlen(tmp_str);
 	while ((*p) != 10 && (*p) != '\0' && (*p) == ' ') p++;
@@ -1100,6 +1146,7 @@ static ssize_t memguard_task_monitor_write(struct file *filp,
 {
 	char buf[BUF_SIZE];
 	int use_mb = 0;
+	struct memguard_info* global = &memguard_info;
 
 	struct memguard_task_monitor_info* tmp_monitor \
 									= kmalloc(sizeof(struct memguard_task_monitor_info), GFP_KERNEL);
@@ -1115,11 +1162,19 @@ static ssize_t memguard_task_monitor_write(struct file *filp,
 
 	if (memguard_init_task_monitor(tmp_monitor, buf, &use_mb) == -1)
 	{
+		kfree(tmp_monitor);
 		return cnt;
 	}
 
 	// ===== create kernel counter
 	// TODO:
+	if (memguard_init_counter_for_task(tmp_monitor) == -1)
+	{
+		kfree(tmp_monitor);
+		printk("[Memguard] :creating task monitor failed\n");
+		return cnt;
+	}
+	list_add(&tmp_monitor->node, &global->taskMonitor);
 
 	return cnt;
 }
@@ -1218,6 +1273,7 @@ int init_module( void )
 
 	global->start_tick = jiffies;
 	global->period_in_ktime = ktime_set(0, g_period_us * 1000);
+	INIT_LIST_HEAD(&global->taskMonitor); // Init the list head of task monitor
 
 	/* initialize all online cpus to be active */
 	cpumask_copy(global->active_mask, cpu_online_mask);
@@ -1372,6 +1428,7 @@ void cleanup_module( void )
 	free_cpumask_var(global->throttle_mask);
 	free_cpumask_var(global->active_mask);
 	free_percpu(core_info);
+	memguard_clear_task_monitor();
 
 	pr_info("module uninstalled successfully\n");
 	return;
