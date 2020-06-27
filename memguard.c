@@ -650,6 +650,7 @@ static void period_timer_callback_slave(void *info)
 enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 {
 	struct memguard_info *global = &memguard_info;
+	struct memguard_task_monitor_info* task_monitor = NULL;
 
 	ktime_t now;
 	int orun;
@@ -675,6 +676,17 @@ enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 #endif
 	memguard_on_each_cpu_mask(global->active_mask,
 		period_timer_callback_slave, (void *)new_period, 0);
+
+	list_for_each_entry(task_monitor, &global->taskMonitor, node)
+	{
+		// stop counter
+		task_monitor->cacheMissCounter->pmu->stop(task_monitor->cacheMissCounter, PERF_EF_UPDATE);
+	
+		local64_set(&task_monitor->cacheMissCounter->hw.period_left, task_monitor->budget);
+
+		// enable performance counter
+		task_monitor->cacheMissCounter->pmu->start(task_monitor->cacheMissCounter, PERF_EF_RELOAD);	
+	}
 
 	DEBUG(trace_printk("master end\n"));
 	return HRTIMER_RESTART;
@@ -839,6 +851,18 @@ static void start_counters(void)
 /**************************************************************************
  * Local Functions
  **************************************************************************/
+
+static struct memguard_task_monitor_info* get_task_monitor_from_task_monitor_list(void * perf_event)
+{
+	struct memguard_info* global = &memguard_info; 
+	struct memguard_task_monitor_info* task_monitor = NULL;
+	list_for_each_entry(task_monitor, &global->taskMonitor, node)
+	{
+		if (task_monitor->cacheMissCounter == perf_event) return task_monitor;
+	}
+	return NULL;
+}
+
 static void event_overflow_callback_task(struct perf_event *event,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
 				    int nmi,
@@ -846,16 +870,35 @@ static void event_overflow_callback_task(struct perf_event *event,
 				    struct perf_sample_data *data,
 				    struct pt_regs *regs)
 {
-	struct memguard_info* global = &memguard_info; 
-	//DEFINE_WAIT(w);
+	struct core_info* cinfo;
+	struct memguard_info* global = &memguard_info;
+	struct memguard_task_monitor_info* task_monitor = get_task_monitor_from_task_monitor_list(event);
+	int cpu = 0;
+	int mask = task_monitor->cpuMask;
+	ktime_t start = ktime_get();
 
-	printk("[Memguard] : task monitor overflow, pid:%d\n", current->pid);
+	printk("[Memguard] : task monitor overflow, pid:%d\n", task_monitor->taskPid);
 
-//	prepare_to_wait(&global->taskMonitorWait, &w, TASK_INTERRUPTIBLE);
+	if (task_monitor == NULL)
+	{
+		printk("[Memguard] :Error, No overflow task 's task monitor in list\n");
+		return;
+	}
 
-//	schedule();
-	
-//	finish_wait(&global->taskMonitorWait, &w);
+	/* no more overflow interrupt */
+	local64_set(&task_monitor->cacheMissCounter->hw.period_left, 0xfffffff);
+
+	for ( ; mask != 0; mask = mask >> 1, cpu++)
+	{
+		if ((mask & 1) == 0) continue;
+
+		cinfo = per_cpu_ptr(core_info, cpu);
+		cinfo->throttled_task = current;
+		cinfo->throttled_time = start;
+
+		cpumask_set_cpu(cpu, global->throttle_mask);
+		wake_up_interruptible(&cinfo->throttle_evt);
+	}
 }
 
 static int memguard_init_counter_for_task(struct memguard_task_monitor_info* monitor)
@@ -1356,7 +1399,6 @@ int init_module( void )
 		cinfo->throttled_task = NULL;
 
 		init_waitqueue_head(&cinfo->throttle_evt);
-		init_waitqueue_head(&global->taskMonitorWait);
 
 		/* initialize statistics */
 		/* update local period information */
