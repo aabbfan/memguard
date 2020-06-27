@@ -948,10 +948,9 @@ static void memguard_delete_task_monitor(pid_t _pid)
 	struct memguard_info* global = &memguard_info;
 
 	struct memguard_task_monitor_info *task_monitor = NULL, *tmp = NULL;
-	int cnt = 0;
+
 	list_for_each_entry_safe(task_monitor, tmp, &(global->taskMonitor), node)
 	{
-		cnt++;
 		if (task_monitor->taskPid != _pid) continue;
 		
 		list_del(&task_monitor->node);
@@ -960,7 +959,6 @@ static void memguard_delete_task_monitor(pid_t _pid)
 		perf_event_release_kernel(task_monitor->cacheMissCounter);
 		kfree(task_monitor);
 	}
-	printk("list length = %d\n", cnt);
 }
 
 static void memguard_clear_task_monitor(void)
