@@ -118,10 +118,10 @@ struct core_info {
 };
 
 // fch add
-// the global structure for Monitor the task
+// define the global structure to Monitor the task
 struct memguard_task_monitor_info
 {
-	pid_t taskPid;	 // the pid of the pid to monitor
+	pid_t taskPid;	 // the pid of the task to monitor
 	struct perf_event* cacheMissCounter;
 	
 	int cpuMask;
@@ -145,6 +145,7 @@ struct memguard_info {
 #endif
 	struct hrtimer hr_timer;
 	struct list_head taskMonitor;
+	wait_queue_head_t taskMonitorWait;
 };
 
 
@@ -838,14 +839,23 @@ static void start_counters(void)
 /**************************************************************************
  * Local Functions
  **************************************************************************/
-static void event_overflow_callback_tmp(struct perf_event *event,
+static void event_overflow_callback_task(struct perf_event *event,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
 				    int nmi,
 #endif
 				    struct perf_sample_data *data,
 				    struct pt_regs *regs)
 {
-	printk("overflow, pid:%d\n", current->pid);
+	struct memguard_info* global = &memguard_info; 
+	//DEFINE_WAIT(w);
+
+	printk("[Memguard] : task monitor overflow, pid:%d\n", current->pid);
+
+//	prepare_to_wait(&global->taskMonitorWait, &w, TASK_INTERRUPTIBLE);
+
+//	schedule();
+	
+//	finish_wait(&global->taskMonitorWait, &w);
 }
 
 static int memguard_init_counter_for_task(struct memguard_task_monitor_info* monitor)
@@ -874,7 +884,7 @@ static int memguard_init_counter_for_task(struct memguard_task_monitor_info* mon
 
 	monitor->cacheMissCounter = perf_event_create_kernel_counter(&sched_perf_hw_attr,
 							-1, tmp_task,
-							event_overflow_callback_tmp, NULL);
+							event_overflow_callback_task, NULL);
 	if (monitor->cacheMissCounter == NULL)
 	{
 		printk("[Memguard] :faile to create task monitor\n");
@@ -931,6 +941,26 @@ _zero:
 	printk("[memguard] : The parameters PID budget and cpumask of taskLimit shouldn't be zero");
 	return -1;
 
+}
+
+static void memguard_delete_task_monitor(pid_t _pid)
+{
+	struct memguard_info* global = &memguard_info;
+
+	struct memguard_task_monitor_info *task_monitor = NULL, *tmp = NULL;
+	int cnt = 0;
+	list_for_each_entry_safe(task_monitor, tmp, &(global->taskMonitor), node)
+	{
+		cnt++;
+		if (task_monitor->taskPid != _pid) continue;
+		
+		list_del(&task_monitor->node);
+
+		perf_event_disable(task_monitor->cacheMissCounter);
+		perf_event_release_kernel(task_monitor->cacheMissCounter);
+		kfree(task_monitor);
+	}
+	printk("list length = %d\n", cnt);
 }
 
 static void memguard_clear_task_monitor(void)
@@ -1167,13 +1197,14 @@ static ssize_t memguard_task_monitor_write(struct file *filp,
 	}
 
 	// ===== create kernel counter
-	// TODO:
 	if (memguard_init_counter_for_task(tmp_monitor) == -1)
 	{
 		kfree(tmp_monitor);
 		printk("[Memguard] :creating task monitor failed\n");
 		return cnt;
 	}
+	memguard_delete_task_monitor(tmp_monitor->taskPid);
+
 	list_add(&tmp_monitor->node, &global->taskMonitor);
 
 	return cnt;
@@ -1327,6 +1358,7 @@ int init_module( void )
 		cinfo->throttled_task = NULL;
 
 		init_waitqueue_head(&cinfo->throttle_evt);
+		init_waitqueue_head(&global->taskMonitorWait);
 
 		/* initialize statistics */
 		/* update local period information */
