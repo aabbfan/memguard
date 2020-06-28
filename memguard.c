@@ -852,13 +852,13 @@ static void start_counters(void)
  * Local Functions
  **************************************************************************/
 
-static struct memguard_task_monitor_info* get_task_monitor_from_task_monitor_list(void * perf_event)
+static struct memguard_task_monitor_info* get_task_monitor_from_task_monitor_list(u64 _id)
 {
 	struct memguard_info* global = &memguard_info; 
 	struct memguard_task_monitor_info* task_monitor = NULL;
 	list_for_each_entry(task_monitor, &global->taskMonitor, node)
 	{
-		if (task_monitor->cacheMissCounter == perf_event) return task_monitor;
+		if (task_monitor->cacheMissCounter->id == _id) return task_monitor;
 	}
 	return NULL;
 }
@@ -872,7 +872,7 @@ static void event_overflow_callback_task(struct perf_event *event,
 {
 	struct core_info* cinfo;
 	struct memguard_info* global = &memguard_info;
-	struct memguard_task_monitor_info* task_monitor = get_task_monitor_from_task_monitor_list(event);
+	struct memguard_task_monitor_info* task_monitor = get_task_monitor_from_task_monitor_list(event->id);
 	int cpu = 0;
 	int mask = task_monitor->cpuMask;
 	ktime_t start = ktime_get();
@@ -885,7 +885,7 @@ static void event_overflow_callback_task(struct perf_event *event,
 		return;
 	}
 
-	/* no more overflow interrupt */
+	// no more overflow interrupt
 	local64_set(&task_monitor->cacheMissCounter->hw.period_left, 0xfffffff);
 
 	for ( ; mask != 0; mask = mask >> 1, cpu++)
