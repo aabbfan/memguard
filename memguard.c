@@ -856,9 +856,14 @@ static struct memguard_task_monitor_info* get_task_monitor_from_task_monitor_lis
 {
 	struct memguard_info* global = &memguard_info; 
 	struct memguard_task_monitor_info* task_monitor = NULL;
+	struct perf_event* child = NULL;
 	list_for_each_entry(task_monitor, &global->taskMonitor, node)
 	{
 		if (task_monitor->cacheMissCounter->id == _id) return task_monitor;
+		list_for_each_entry(child, &task_monitor->cacheMissCounter->child_list, child_list)
+		{
+			if (child->id == _id) return task_monitor;
+		}
 	}
 	return NULL;
 }
@@ -877,14 +882,14 @@ static void event_overflow_callback_task(struct perf_event *event,
 	int mask = task_monitor->cpuMask;
 	ktime_t start = ktime_get();
 
-	printk("[Memguard] : task monitor overflow, pid:%d\n", task_monitor->taskPid);
+	//printk("[Memguard] : task monitor overflow, pid:%d\n", task_monitor->taskPid);
 
 	if (task_monitor == NULL)
 	{
-		printk("[Memguard] :Error, No overflow task 's task monitor in list\n");
+		printk("[Memguard] :Error, No %lld task monitor in list\n", event->id);
 		return;
 	}
-
+	
 	// no more overflow interrupt
 	local64_set(&task_monitor->cacheMissCounter->hw.period_left, 0xfffffff);
 
@@ -963,6 +968,7 @@ static int memguard_init_task_monitor(struct memguard_task_monitor_info* monitor
 
 	sscanf(p, "%s", tmp_str);
 	monitor->budget = simple_strtol(tmp_str, NULL, 10);
+	if (*use_mb) monitor->budget = (unsigned long)convert_events_to_mb(monitor->budget);
 	if (monitor->budget <= 0) goto _zero;
 	p += strlen(tmp_str);
 	while ((*p) != 10 && (*p) != '\0' && (*p) == ' ') p++;
