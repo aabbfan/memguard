@@ -644,13 +644,37 @@ static void period_timer_callback_slave(void *info)
 	cinfo->event->pmu->start(cinfo->event, PERF_EF_RELOAD);
 }
 
+static void period_timer_task_monitor(void)
+{
+	struct memguard_info *global = &memguard_info;
+	struct memguard_task_monitor_info* task_monitor = NULL;
+	struct perf_event *child = NULL;
+
+	list_for_each_entry(task_monitor, &global->taskMonitor, node)
+	{
+		// stop counter
+		task_monitor->cacheMissCounter->pmu->stop(task_monitor->cacheMissCounter, PERF_EF_UPDATE);
+	
+		local64_set(&task_monitor->cacheMissCounter->hw.period_left, task_monitor->budget);
+
+		// enable performance counter
+		task_monitor->cacheMissCounter->pmu->start(task_monitor->cacheMissCounter, PERF_EF_RELOAD);	
+
+		list_for_each_entry(child, &task_monitor->cacheMissCounter->child_list, child_list)
+		{
+			child->pmu->stop(child, PERF_EF_UPDATE);
+			local64_set(&child->hw.period_left, task_monitor->budget);
+			child->pmu->start(child, PERF_EF_UPDATE);
+		}
+	}
+}
+
 /**
  *   called while cpu_base->lock is held by hrtimer_interrupt()
  */
 enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 {
 	struct memguard_info *global = &memguard_info;
-	struct memguard_task_monitor_info* task_monitor = NULL;
 
 	ktime_t now;
 	int orun;
@@ -677,16 +701,7 @@ enum hrtimer_restart period_timer_callback_master(struct hrtimer *timer)
 	memguard_on_each_cpu_mask(global->active_mask,
 		period_timer_callback_slave, (void *)new_period, 0);
 
-	list_for_each_entry(task_monitor, &global->taskMonitor, node)
-	{
-		// stop counter
-		task_monitor->cacheMissCounter->pmu->stop(task_monitor->cacheMissCounter, PERF_EF_UPDATE);
-	
-		local64_set(&task_monitor->cacheMissCounter->hw.period_left, task_monitor->budget);
-
-		// enable performance counter
-		task_monitor->cacheMissCounter->pmu->start(task_monitor->cacheMissCounter, PERF_EF_RELOAD);	
-	}
+	period_timer_task_monitor();
 
 	DEBUG(trace_printk("master end\n"));
 	return HRTIMER_RESTART;
@@ -978,7 +993,7 @@ static int memguard_init_task_monitor(struct memguard_task_monitor_info* monitor
 	monitor->cpuMask = simple_strtol(tmp_str, NULL, 2);
 	if (monitor->cpuMask <= 0) goto _zero;
 
-	printk("[Memguard] : task monitor new config --- pid: %d budget: %d cpumask: %d use_num: %d\n", monitor->taskPid,
+	printk("[Memguard] : task monitor new config --- pid: %d budget: %d cpumask: %d use_mb: %d\n", monitor->taskPid,
 																		monitor->budget,																monitor->cpuMask,
 																		*use_mb);
 	return 0;
