@@ -146,6 +146,8 @@ struct memguard_info {
 	struct hrtimer hr_timer;
 	struct list_head taskMonitor;
 	wait_queue_head_t taskMonitorWait;
+	struct irq_work taskPending;
+	uint64_t taskMonitorNumber;
 };
 
 
@@ -883,25 +885,20 @@ static struct memguard_task_monitor_info* get_task_monitor_from_task_monitor_lis
 	return NULL;
 }
 
-static void event_overflow_callback_task(struct perf_event *event,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
-				    int nmi,
-#endif
-				    struct perf_sample_data *data,
-				    struct pt_regs *regs)
+static void event_overflow_callback_task_master(struct irq_work *entry)
 {
 	struct core_info* cinfo;
 	struct memguard_info* global = &memguard_info;
-	struct memguard_task_monitor_info* task_monitor = get_task_monitor_from_task_monitor_list(event->id);
+	struct memguard_task_monitor_info* task_monitor = get_task_monitor_from_task_monitor_list(global->taskMonitorNumber);
 	int cpu = 0;
 	int mask = task_monitor->cpuMask;
 	ktime_t start = ktime_get();
 
-	//printk("[Memguard] : task monitor overflow, pid:%d\n", task_monitor->taskPid);
+	//printk("[Memguard] : task monitor overflow, pid:%d\n", global->taskMonitorNumber);
 
 	if (task_monitor == NULL)
 	{
-		printk("[Memguard] :Error, No %lld task monitor in list\n", event->id);
+		printk("[Memguard] :Error, No %lld task monitor in list\n", global->taskMonitorNumber);
 		return;
 	}
 	
@@ -919,6 +916,18 @@ static void event_overflow_callback_task(struct perf_event *event,
 		cpumask_set_cpu(cpu, global->throttle_mask);
 		wake_up_interruptible(&cinfo->throttle_evt);
 	}
+}
+
+static void event_overflow_callback_task(struct perf_event *event,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 2, 0)
+				    int nmi,
+#endif
+				    struct perf_sample_data *data,
+				    struct pt_regs *regs)
+{
+	struct memguard_info* global = &memguard_info;
+	global->taskMonitorNumber = event->id;
+	irq_work_queue(&global->taskPending);
 }
 
 static int memguard_init_counter_for_task(struct memguard_task_monitor_info* monitor)
@@ -1364,6 +1373,7 @@ int init_module( void )
 		return -ENODEV;
 	}
 
+	global->taskMonitorNumber = 0;
 	global->start_tick = jiffies;
 	global->period_in_ktime = ktime_set(0, g_period_us * 1000);
 	INIT_LIST_HEAD(&global->taskMonitor); // Init the list head of task monitor
@@ -1452,6 +1462,8 @@ int init_module( void )
 		kthread_bind(cinfo->throttle_thread, i);
 		wake_up_process(cinfo->throttle_thread);
 	}
+
+	init_irq_work(&global->taskPending, event_overflow_callback_task_master);
 
 	memguard_init_debugfs();
 
