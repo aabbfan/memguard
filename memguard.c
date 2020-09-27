@@ -229,6 +229,22 @@ MODULE_PARM_DESC(g_period_us, "throttling period in usec");
 /**************************************************************************
  * Module main code
  **************************************************************************/
+/*
+*	 shamefully stole it from linux kernel
+*/
+static void memguard_disable_task_perf_event(struct perf_event *event)
+{
+	struct perf_event *child;
+	WARN_ON_ONCE(event->ctx->parent_ctx);	// never apply this function to a child
+	mutex_lock(&event->child_mutex);
+	perf_event_disable(event);
+	list_for_each_entry(child, &event->child_list, child_list)
+	{
+		perf_event_disable(child);
+	}
+	mutex_unlock(&event->child_mutex);
+}
+
 /* similar to on_each_cpu_mask(), but this must be called with IRQ disabled */
 static void memguard_on_each_cpu_mask(const struct cpumask *mask, 
 				      smp_call_func_t func,
@@ -646,6 +662,22 @@ static void period_timer_callback_slave(void *info)
 	cinfo->event->pmu->start(cinfo->event, PERF_EF_RELOAD);
 }
 
+static void _stop_counters_task(void)
+{
+	struct memguard_info *global = &memguard_info;
+	struct memguard_task_monitor_info* task_monitor = NULL;
+	struct perf_event *child = NULL;
+
+	list_for_each_entry(task_monitor, &global->taskMonitor, node)
+	{
+		task_monitor->cacheMissCounter->pmu->stop(task_monitor->cacheMissCounter, PERF_EF_UPDATE);
+		list_for_each_entry(child, &task_monitor->cacheMissCounter->child_list, child_list)
+		{
+			child->pmu->stop(child, PERF_EF_UPDATE);
+		}
+	}
+}
+
 static void period_timer_task_monitor(void)
 {
 	struct memguard_info *global = &memguard_info;
@@ -847,6 +879,7 @@ static void __disable_counter(void *info)
 static void disable_counters(void)
 {
 	on_each_cpu(__disable_counter, NULL, 0);
+	_stop_counters_task();
 }
 
 
@@ -889,19 +922,20 @@ static void event_overflow_callback_task_master(struct irq_work *entry)
 {
 	struct core_info* cinfo;
 	struct memguard_info* global = &memguard_info;
-	struct memguard_task_monitor_info* task_monitor = get_task_monitor_from_task_monitor_list(global->taskMonitorNumber);
+	struct memguard_task_monitor_info* task_monitor;
 	int cpu = 0;
-	int mask = task_monitor->cpuMask;
+	int mask;
 	ktime_t start = ktime_get();
 
-	//printk("[Memguard] : task monitor overflow, pid:%d\n", global->taskMonitorNumber);
-
+	BUG_ON(in_nmi() || !in_irq());
+	task_monitor = get_task_monitor_from_task_monitor_list(global->taskMonitorNumber);
 	if (task_monitor == NULL)
 	{
 		printk("[Memguard] :Error, No %lld task monitor in list\n", global->taskMonitorNumber);
 		return;
 	}
-	
+	mask = task_monitor->cpuMask;
+
 	// no more overflow interrupt
 	local64_set(&task_monitor->cacheMissCounter->hw.period_left, 0xfffffff);
 
@@ -1028,7 +1062,7 @@ static void memguard_delete_task_monitor(pid_t _pid)
 		
 		list_del(&task_monitor->node);
 
-		perf_event_disable(task_monitor->cacheMissCounter);
+		memguard_disable_task_perf_event(task_monitor->cacheMissCounter);
 		perf_event_release_kernel(task_monitor->cacheMissCounter);
 		kfree(task_monitor);
 	}
@@ -1044,7 +1078,7 @@ static void memguard_clear_task_monitor(void)
 	{
 		list_del(&task_monitor->node);
 
-		perf_event_disable(task_monitor->cacheMissCounter);
+		memguard_disable_task_perf_event(task_monitor->cacheMissCounter);
 		perf_event_release_kernel(task_monitor->cacheMissCounter);
 		kfree(task_monitor);
 	}
